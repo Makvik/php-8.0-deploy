@@ -1,0 +1,108 @@
+stages:
+  - preparation
+  - compile_assets
+  - deploy_test
+  - deploy_production
+
+variables:
+  GIT_SSL_NO_VERIFY: "true"
+  SERVER_IP: "user@127.0.0.1"
+  PROJECT: 'project_dir_prod'
+  SERVER_PROJECT_DIR: "/www/$PROJECT/"
+  TEST_PROJECT: 'project_dir_test'
+  TEST_SERVER_PROJECT_DIR: "/www/$TEST_PROJECT/"
+  SERVER_COMPOSER: '/web/php/composer/composer.phar'
+  PHP_VERSION: 'php74'
+  RSYNC_EXCLUDEFILE: ".rsync_exclude_file"
+
+# https://hub.docker.com/repository/docker/makvik/php-7.4-deploy
+image: makvik/php-7.4-deploy:latest
+
+# Cache modules in between jobs
+cache:
+  key: "$CI_PROJECT_ID"
+  paths:
+    - .composer/
+    - node_modules/
+    - vendor/
+
+Preparation:
+  stage: preparation
+  script:
+    - echo "Composer Install"
+    - composer config -g cache-dir .composer/
+    - composer install --optimize-autoloader
+
+    - echo "NPM Install"
+    - npm install
+
+Compile assets:
+  stage: compile_assets
+  script:
+    - echo "Compile assets"
+    - npm run prod
+  artifacts:
+    paths:
+      - public/css
+      - public/fonts
+      - public/js
+      - public/mix-manifest.json
+    expire_in: 7 days
+    when: always
+
+Deploy to test:
+  stage: deploy_test
+  only:
+    - master
+  before_script:
+    - echo "Add target servers secret key"
+    - mkdir ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 700 ~/.ssh && chmod 600 ~/.ssh/*
+  script:
+    - echo "Sync local and remote directory"
+    - rsync -ltDrOz --no-perms --no-owner --no-group --no-times --chmod=Dug=rwX,Do=rX,Fug=rw,Fo=r --chown=nginx:www -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" $RSYNC_EXCLUDE "$CI_PROJECT_DIR/" "$SERVER_IP:$TEST_SERVER_PROJECT_DIR" --exclude-from="$RSYNC_EXCLUDEFILE"
+
+    - echo "Add FIX Permission"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "sudo /web/scripts/permissions/www_permissions_reset.sh $TEST_PROJECT"
+
+    - echo "Running Clear Cache"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "cd $TEST_SERVER_PROJECT_DIR; $PHP_VERSION artisan config:cache; $PHP_VERSION artisan route:clear; $PHP_VERSION artisan config:clear; $PHP_VERSION artisan config:cache; $PHP_VERSION artisan cache:clear;"
+
+    - echo "Running Migrations"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "cd $TEST_SERVER_PROJECT_DIR; $PHP_VERSION artisan migrate --force"
+
+    - echo "Running Seeds"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "cd $TEST_SERVER_PROJECT_DIR; $PHP_VERSION artisan db:seed --force"
+
+    - echo "Restart Horizon"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "sudo /web/scripts/supervisord/restart_horizon.sh $TEST_SERVER_PROJECT_DIR"
+
+Deploy to production:
+  stage: deploy_production
+  when: manual
+  only:
+    - master
+  before_script:
+    - echo "Add target servers secret key"
+    - mkdir ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 700 ~/.ssh && chmod 600 ~/.ssh/*
+  script:
+    - echo "Sync local and remote directory"
+    - rsync -ltDrOz --no-perms --no-owner --no-group --no-times --chmod=Dug=rwX,Do=rX,Fug=rw,Fo=r --chown=nginx:www -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" $RSYNC_EXCLUDE "$CI_PROJECT_DIR/" "$SERVER_IP:$SERVER_PROJECT_DIR" --exclude-from="$RSYNC_EXCLUDEFILE"
+
+    - echo "Add FIX Permission"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "sudo /web/scripts/permissions/www_permissions_reset.sh $PROJECT;"
+
+    - echo "Running Clear Cache"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "cd $SERVER_PROJECT_DIR; $PHP_VERSION artisan config:cache; $PHP_VERSION artisan route:clear; $PHP_VERSION artisan config:clear; $PHP_VERSION artisan config:cache; $PHP_VERSION artisan cache:clear;"
+
+    - echo "Running Migrations"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "cd $SERVER_PROJECT_DIR; $PHP_VERSION artisan migrate --force;"
+
+    - echo "Running Seeds"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "cd $SERVER_PROJECT_DIR; $PHP_VERSION artisan db:seed --force;"
+
+    - echo "Restart Horizon"
+    - ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SERVER_IP" "sudo /web/scripts/supervisord/restart_horizon.sh $SERVER_PROJECT_DIR;"
